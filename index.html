@@ -1,0 +1,225 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<title>Escáner de códigos</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+    background: #f4f5f7; color: #1d1d1f; padding: 12px;
+  }
+  h1 { font-size: 1.3rem; margin: 4px 0 12px; }
+  .card { background: #fff; border-radius: 12px; padding: 12px; margin-bottom: 12px; box-shadow: 0 1px 3px rgba(0,0,0,.08); }
+  #video-wrap { position: relative; width: 100%; background: #000; border-radius: 10px; overflow: hidden; aspect-ratio: 4 / 3; }
+  #video { width: 100%; height: 100%; object-fit: cover; }
+  #scan-line {
+    position: absolute; left: 10%; right: 10%; top: 50%; height: 2px;
+    background: #ff3b30; box-shadow: 0 0 6px #ff3b30; pointer-events: none;
+  }
+  .row { display: flex; gap: 8px; margin-top: 8px; }
+  button {
+    flex: 1; border: 0; border-radius: 10px; padding: 14px; font-size: 1rem; font-weight: 600;
+    background: #0a84ff; color: #fff; cursor: pointer;
+  }
+  button.secondary { background: #e5e5ea; color: #1d1d1f; }
+  button:disabled { opacity: .5; }
+  label { display: block; font-size: .85rem; color: #555; margin-top: 10px; }
+  input, select, textarea {
+    width: 100%; font-size: 1rem; padding: 10px; margin-top: 4px;
+    border: 1px solid #c7c7cc; border-radius: 8px; background: #fff;
+  }
+  textarea { min-height: 60px; resize: vertical; }
+  #status { margin-top: 10px; padding: 10px; border-radius: 8px; display: none; font-size: .95rem; }
+  #status.ok { display: block; background: #d1f7d6; color: #145c24; }
+  #status.err { display: block; background: #ffd6d3; color: #7a1b13; }
+  #status.info { display: block; background: #dbeafe; color: #1e3a8a; }
+  .hint { font-size: .8rem; color: #666; margin-top: 6px; }
+</style>
+</head>
+<body>
+<h1>Escáner de códigos</h1>
+
+<div class="card">
+  <div id="video-wrap">
+    <video id="video" playsinline muted autoplay></video>
+    <div id="scan-line"></div>
+  </div>
+  <div class="row">
+    <button id="btn-cam">Iniciar cámara</button>
+    <button id="btn-stop" class="secondary" disabled>Detener</button>
+  </div>
+  <div class="hint">Apunta la cámara al código de barras EAN-13 o Code 128. Funciona en Android e iPhone (usa HTTPS).</div>
+</div>
+
+<div class="card">
+  <label>Código leído
+    <input id="codigo" type="text" autocomplete="off" placeholder="Escanea o escribe a mano">
+  </label>
+  <label>Formato
+    <input id="formato" type="text" readonly placeholder="Se llena al escanear">
+  </label>
+  <label>Tipo
+    <select id="tipo">
+      <option value="Bodega">Bodega</option>
+      <option value="Medidor">Medidor</option>
+    </select>
+  </label>
+  <label>Cantidad o lectura
+    <input id="cantidad" type="text" inputmode="decimal" placeholder="Ej.: 3 o 1254.6">
+  </label>
+  <label>Usuario
+    <input id="usuario" type="text" autocomplete="name" placeholder="Tu nombre">
+  </label>
+  <label>Notas
+    <textarea id="notas" placeholder="Opcional"></textarea>
+  </label>
+  <div class="row">
+    <button id="btn-guardar">Guardar</button>
+  </div>
+  <div id="status"></div>
+</div>
+
+<script src="https://unpkg.com/@zxing/library@0.21.3/umd/index.min.js"></script>
+<script>
+  // ---- Configuración ----
+  const URL_SCRIPT = 'https://script.google.com/macros/s/AKfycbwvUrwGQp_IDrzabbfbWvIle3fE4zgxMlh6ZGItLhuUlyn1cApH4IfOZ9-te7UQKOL4pw/exec';
+  const TOKEN = 'ESC-7391-kdLx-Rivera';
+  const HOJA = 'Escaneos';
+
+  // ---- Elementos ----
+  const $ = id => document.getElementById(id);
+  const video = $('video');
+  const btnCam = $('btn-cam');
+  const btnStop = $('btn-stop');
+  const btnGuardar = $('btn-guardar');
+  const statusEl = $('status');
+
+  let reader = null;
+  let ultimoCodigo = '';
+  let ultimoTiempo = 0;
+
+  // Recordar tipo y usuario entre usos
+  ['tipo', 'usuario'].forEach(id => {
+    const guardado = localStorage.getItem('esc_' + id);
+    if (guardado) $(id).value = guardado;
+    $(id).addEventListener('change', () => localStorage.setItem('esc_' + id, $(id).value));
+  });
+  $('usuario').addEventListener('input', () => localStorage.setItem('esc_usuario', $('usuario').value));
+
+  function mostrar(texto, tipo) {
+    statusEl.textContent = texto;
+    statusEl.className = tipo;
+  }
+
+  function nombreFormato(fmt) {
+    const n = ZXing.BarcodeFormat[fmt] || String(fmt);
+    if (n.includes('EAN_13')) return 'EAN-13';
+    if (n.includes('CODE_128')) return 'Code 128';
+    return n;
+  }
+
+  // ---- Cámara ----
+  async function iniciarCamara() {
+    if (!window.ZXing) {
+      mostrar('No se cargó el lector de códigos. Revisa tu conexión a internet.', 'err');
+      return;
+    }
+    try {
+      const hints = new Map();
+      hints.set(ZXing.DecodeHintType.POSSIBLE_FORMATS, [
+        ZXing.BarcodeFormat.EAN_13,
+        ZXing.BarcodeFormat.CODE_128
+      ]);
+      hints.set(ZXing.DecodeHintType.TRY_HARDER, true);
+      reader = new ZXing.BrowserMultiFormatReader(hints);
+
+      await reader.decodeFromConstraints(
+        { video: { facingMode: { ideal: 'environment' } }, audio: false },
+        video,
+        (resultado, error) => {
+          if (resultado) {
+            const texto = resultado.getText();
+            const ahora = Date.now();
+            // Evita leer el mismo código repetidamente
+            if (texto === ultimoCodigo && ahora - ultimoTiempo < 2000) return;
+            ultimoCodigo = texto;
+            ultimoTiempo = ahora;
+            $('codigo').value = texto;
+            $('formato').value = nombreFormato(resultado.getBarcodeFormat());
+            if (navigator.vibrate) navigator.vibrate(120);
+            mostrar('Código leído: ' + texto, 'info');
+          }
+        }
+      );
+      btnCam.disabled = true;
+      btnStop.disabled = false;
+      mostrar('Cámara activa. Apunta al código.', 'info');
+    } catch (e) {
+      mostrar('No se pudo abrir la cámara: ' + (e && e.message ? e.message : e) +
+        '. Revisa que hayas dado permiso de cámara al navegador.', 'err');
+    }
+  }
+
+  function detenerCamara() {
+    if (reader) {
+      try { reader.reset(); } catch (e) {}
+      reader = null;
+    }
+    if (video.srcObject) {
+      video.srcObject.getTracks().forEach(t => t.stop());
+      video.srcObject = null;
+    }
+    btnCam.disabled = false;
+    btnStop.disabled = true;
+  }
+
+  btnCam.addEventListener('click', iniciarCamara);
+  btnStop.addEventListener('click', detenerCamara);
+
+  // ---- Guardar ----
+  btnGuardar.addEventListener('click', async () => {
+    const codigo = $('codigo').value.trim();
+    const cantidad = $('cantidad').value.trim();
+    if (!codigo) { mostrar('Escribe o escanea un código primero.', 'err'); return; }
+    if (!cantidad) { mostrar('Escribe la cantidad o la lectura.', 'err'); return; }
+
+    const datos = {
+      token: TOKEN,
+      hoja: HOJA,
+      fecha: new Date().toISOString(),
+      tipo: $('tipo').value,
+      codigo: codigo,
+      formato: $('formato').value,
+      cantidad: cantidad,
+      usuario: $('usuario').value.trim(),
+      notas: $('notas').value.trim()
+    };
+
+    btnGuardar.disabled = true;
+    mostrar('Guardando...', 'info');
+    try {
+      // text/plain evita el preflight CORS; Apps Script lee el cuerpo JSON igual.
+      // Con no-cors no podemos leer la respuesta: se confirma revisando la hoja.
+      await fetch(URL_SCRIPT, {
+        method: 'POST',
+        mode: 'no-cors',
+        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+        body: JSON.stringify(datos)
+      });
+      mostrar('Enviado a la hoja "' + HOJA + '". Revisa que aparezca la fila.', 'ok');
+      $('codigo').value = '';
+      $('formato').value = '';
+      $('cantidad').value = '';
+      $('notas').value = '';
+      ultimoCodigo = '';
+    } catch (e) {
+      mostrar('No se pudo enviar: ' + (e && e.message ? e.message : e), 'err');
+    } finally {
+      btnGuardar.disabled = false;
+    }
+  });
+</script>
+</body>
+</html>
